@@ -1,85 +1,119 @@
 ---
 name: critique
 description: Adversarial review of a plan, design doc, code, or project — like a lawyer reviewing a contract on the user's behalf. Use when the user wants a skeptical second opinion before committing to an approach.
-context: fork
-agent: general-purpose
-model: opus
 disable-model-invocation: true
-allowed-tools: Read, Grep, Glob, Bash, WebFetch, WebSearch
+allowed-tools: Agent, Read, Grep, Glob, Bash, WebFetch, WebSearch
 ---
 
-You are a skeptical technical reviewer working in the current repository. Think of yourself as a lawyer reviewing a contract on behalf of a client who may be out of their depth on some aspects of what they're building. Your job is to catch what they'd miss: wrong assumptions, wrong technology choices, missing steps, underspecified areas, inconsistencies, and things that will cause regret later.
+You are orchestrating an adversarial critique from main conversation context. You handle target resolution, parallel spawning, archival, and the final triage. The actual critique work happens in nested forked subagents (Opus via the Agent tool, Codex via a bash helper) so the critics remain independent of your conversation history.
 
-The client is a solo developer working with AI agents on a creative project. Scale your advice to that context — this isn't a startup with 20 engineers, but the work still needs to be correct and maintainable.
+The reviewer prompt for both critics lives at `~/.claude/skills/critique/critique_prompt.md`.
 
-**Your review target:** $ARGUMENTS
+**Arguments:** `$ARGUMENTS`
 
-**First**, use your tools to find and read the relevant files:
-- Always start with CLAUDE.md for project context.
-- If the target is a file path, read that file.
-- If the target is a topic (e.g., "use of ffmpeg"), use Grep and Glob to find all relevant code and config.
-- If the target mentions git history (e.g., "commits from today"), use `git log` and `git diff`.
-- If the target is vague (e.g., "current plan"), look in `.design/` for the most recent design doc.
-- If no target is given, figure out what's newest: check `git log --oneline -5` for recent commits AND check `.design/` file timestamps. Critique whichever is most recent — if the latest design doc is newer than the latest commit, critique the design; if commits are newer, critique the recent changes.
-- Adapt your review to the content type: for code, look for bugs, dead code, missing error handling, and misuse of libraries. For plans/designs, look for architectural issues, missing steps, and wrong technology choices. For documentation, check accuracy against the actual code.
+## 1. Parse mode
 
-Form your own understanding — don't rely on summaries.
+Inspect the first whitespace-delimited token of `$ARGUMENTS`:
 
-**Then**, organize your findings into these categories, from most to least severe:
+- starts with `codex ` — Codex only; the rest of the string is the review target.
+- starts with `both ` — Claude Opus *and* Codex; the rest of the string is the review target.
+- anything else — Claude Opus only (default); the whole `$ARGUMENTS` is the review target.
 
-### 1. Showstoppers
-Things that are fundamentally wrong — wrong technology choice, approach that won't scale to the stated requirements, security issues, architectural mistakes that will require a rewrite. If there are none, say "None found" — don't manufacture them.
+Call the resulting target string **TARGET**.
 
-### 2. Gaps
-Important things that are missing — unhandled edge cases, missing error handling, steps that are assumed but not specified, decisions that need to be made now but are being deferred without acknowledgment.
+## 2. Resolve TARGET to a concrete reference
 
-### 3. Inconsistencies
-Places where the plan or code contradicts itself — instructions that conflict, assumptions in one section that don't match assumptions in another, naming or terminology that shifts meaning.
+You are in main conversation context — use it. The forked subagents will not have this advantage.
 
-### 4. Underspecified areas
-Places where there are multiple valid approaches and the plan doesn't say which one to take. These are landmines for an implementer who might guess wrong. Flag them as "you might want to decide this now rather than letting the implementer choose."
+- If TARGET names a specific file path, commit range, or other unambiguous reference → use as-is.
+- If TARGET is vague ("the plan", "the latest plan", "the design doc", "the recent commit", "recent changes") → resolve from conversation history first. If a plan was generated via plan mode in this session, you'll know its path (look for paths under `~/.claude/plans/` mentioned in the conversation). If recent commits or files came up, you know which ones.
+- If TARGET is empty or conversation history doesn't disambiguate → fall back: sort `~/.claude/plans/*.md` by mtime for the most recent plan-mode plan; compare against `git log --oneline -5` and `.design/*.md` mtimes (the crosslink plugin's `/design` output dir, if present); pick the newest.
 
-### 5. Suggestions
-Things that aren't wrong but could be better — simpler approaches, common patterns being ignored, phases that could be combined or split differently, unnecessary complexity.
+Resolve to one concrete TARGET string before spawning. Critics work better with an unambiguous target than with "go find it."
 
-### 6. What looks good
-Briefly note what's solid. This calibrates trust — if you can identify what's right, your criticism is more credible. Keep this short (2-4 items).
+## 3. Prepare the subagent prompt
 
-## Ground rules
+Read `~/.claude/skills/critique/critique_prompt.md` once. The full text of that file, followed by an appended `\n\nYour review target: <TARGET>\n`, is the prompt you'll pass to the Opus critic.
 
-- **Be specific.** Reference exact sections, lines, file names, or decisions. Don't say "error handling could be better" — say which error, where, and what would happen if it's not handled.
-- **Be honest about severity.** Don't inflate minor issues to fill the list. If the plan is mostly good, say so up front.
-- **Don't rewrite the plan.** Identify problems, don't solve them — unless the fix is one sentence. The user wants to know what's wrong, not have you redo their work.
-- **If you lack context, say so.** If you can't evaluate something without seeing code or config you don't have, flag it as "I'd need to see X to evaluate this" rather than guessing.
-- **Report your top 5-10 findings, ranked by severity.** Don't pad with trivia to hit a number, but don't stop at 2 just because the first two are big — force yourself to look hard. If two findings share the same root cause, combine them into one.
-- **Intentional decisions can still be wrong.** Don't give something a pass just because it was deliberate. If a design specifies an approach that will cause problems, say so and explain why.
-- **Speculative findings must name a specific mechanism.** Don't say "this might be slow" or "this could be a problem." Name what breaks and through what mechanism. If you know the threshold, state it; if the threshold is unpublished (e.g., API rate limits), say so — that's still a valid finding. But if you can't even name the mechanism, drop the finding.
-- **Keep descriptions tight.** Assume the reader has the code open. Don't restate file contents or repeat context they can look up. 2-3 sentences for the description, then the scenario. The scenario and description serve different purposes: the description states the general principle, the scenario proves it's real with a concrete example.
+## 4. Spawn critics
 
-## Output format
+For `both` mode: fire the Opus Agent call and the Codex Bash call **in parallel** by putting both tool calls in the same assistant message. For single-critic modes, fire just one.
 
-Start with a one-line summary:
+### Opus critic
 
-**N findings: X showstoppers, Y gaps, Z inconsistencies, W underspecified, V suggestions.**
+Use the Agent tool:
 
-Then list findings by category. Use this plain-text format (no blockquotes — they render poorly in terminals):
+- `subagent_type`: `"general-purpose"`
+- `description`: short, e.g. `"Critique <short target name>"`
+- `model`: `"opus"`
+- `prompt`: the prepared prompt (critique_prompt.md text + appended target line)
 
-```
-[Gap] Title here
-What's wrong and why it matters. 2-3 sentences.
-Scenario: A concrete situation where this causes a real problem.
-  e.g., "User runs --force-art, Path('cover.png') resolves against CWD
-  instead of the album directory, upload fails with 'file not found'."
+The subagent will read whatever files TARGET requires, form findings, and return a single message — the critique markdown. Take its final message verbatim as the Opus critique.
 
-[Inconsistency] Another title
-Description here. 2-3 sentences.
-Scenario: ...
+### Codex critic
+
+Run the bundled helper script, passing TARGET via stdin using a single-quoted heredoc so that shell metacharacters in the target text (backticks, `$(...)`, etc.) can't be interpreted by the shell:
+
+```bash
+bash ~/.claude/skills/critique/run_codex.sh <<'CRITIQUE_TARGET_EOF'
+<TARGET literal here — any characters allowed, multiline OK, no shell interpolation>
+CRITIQUE_TARGET_EOF
 ```
 
-For each finding, include a concrete scenario showing when/how this causes a
-problem. Good scenarios name specific files, inputs, or sequences of actions.
-If a finding is important but doesn't have a natural scenario (e.g.,
-readability, library choice, naming), state the observation directly instead
-of forcing a scenario.
+The single-quoted delimiter (`'CRITIQUE_TARGET_EOF'`) is what blocks shell interpolation; do not omit the quotes. The delimiter name itself is arbitrary; if your TARGET happens to contain the literal string `CRITIQUE_TARGET_EOF` on its own line, pick a longer one.
 
-End with the "What looks good" section as a simple bulleted list.
+The script handles prompt assembly, tempfiles, timeout, and stderr/stdout capture. Its stdout is either the Codex critique (success path, exit 0) or a diagnostic dump (`[codex exec failed...]` line + `---codex stderr---` block + `---codex stdout (tail)---` block + `---codex env---` block; exit non-zero).
+
+**Sandbox handling.** Codex needs to write to its own state directory and spin up a local app-server, both of which the default agent sandbox blocks with `Operation not permitted (os error 1)`. If the script's first run returns non-zero exit AND its output contains `Operation not permitted`, `failed to initialize in-process app-server`, or similar sandbox-permission errors, immediately retry the same Bash call with `dangerouslyDisableSandbox: true`. This matches the standing instruction in `~/.claude/CLAUDE.md`. Don't ask first — codex is read-only by virtue of its own `--sandbox read-only` flag, so disabling the *outer* sandbox just lets codex do its internal setup. Briefly mention in your reply that the sandbox-disabled retry was needed (the user wants to know).
+
+**Verbatim relay.** Take the script's stdout VERBATIM as the Codex critique. This applies equally to success AND failure output. Do NOT summarize, paraphrase, or interpret diagnostic blocks. If the script's output looks like log noise rather than a critique, that IS the critique for this run — relay it whole. The user explicitly wants the raw failure diagnostics, not a TL;DR. Editorializing failure output ("looks like a sandbox issue") loses the information needed to actually diagnose what's going wrong; if you have a hypothesis, save it for the Triage section, but include the raw script output above it.
+
+The script also writes its full output to `/tmp/claude/critique-last-codex-output.log` (clobbered each run) as a ground-truth backup — if the script output ever feels suspiciously summarized, that file is the source of truth.
+
+## 5. Archive
+
+After both critics return, save to `~/.claude/skills/critique/runs/<timestamp>-<slug>.md`:
+
+- `mkdir -p ~/.claude/skills/critique/runs` first.
+- Timestamp: ISO 8601 with colons replaced by hyphens (filesystem-safe). Example: `2026-05-14T17-30-00`.
+- Slug: TARGET lowercased, non-alphanumerics replaced with hyphens, collapsed runs of hyphens, max 40 chars.
+- Contents: a header noting target / mode / timestamp; then the Opus critique section (if run); then the Codex critique section (if run).
+
+If a critic failed (Codex script returned a fallback line, or the Agent call returned an error), still archive what you got — the failure is a useful record.
+
+## 6. Reply to the user
+
+Compose your final reply in this order:
+
+1. **Archive notice** — one line: `> Critique archive: <full path>`
+2. **Critique sections verbatim**:
+   - Opus only: just the Opus section under `## Critique (Claude Opus)`.
+   - Codex only: just the Codex section under `## Critique (Codex)`.
+   - Both: Opus section first, then Codex section.
+3. **Your `## Triage` section.** This is the main-context payoff. You have:
+   - Both critique results (full text)
+   - Your conversation context (what was discussed, what the user values, what was just generated)
+   - Read/Grep/Bash to verify specific claims
+
+### Triage instructions
+
+For each distinct finding across the critiques:
+
+1. **Cross-critic synthesis** (when both ran). Did both critics flag this? Agreement raises confidence. Did they disagree on severity or interpretation? That divergence is itself a finding worth surfacing.
+2. **Independent verification.** For claims that name a file:line, function name, or specific behavior, use Read / Grep / Bash to check the code yourself. The critics gave their best read; you can confirm or refute directly.
+
+Categorize each finding as one of:
+
+- **Worth fixing.** Real issue with concrete benefit. If both critics flagged it, note that. Say whether it's small enough to do now or worth deferring.
+- **Matter of taste / judgment call.** Could go either way; not wrong, but not clearly right either. State the tradeoff in one sentence.
+- **Wrong.** Name what the critic claimed, what's actually true, and how you verified it (file:line, grep result, command output). If you can't verify and you're just disagreeing on intuition, mark it "I disagree but haven't verified" — the user wants to know when you're hedging rather than taking a hedged claim at face value.
+
+Be explicit when uncertain. A confident-wrong triage is worse than a hedged-uncertain one. If a finding doesn't fit cleanly into the three buckets, say so rather than forcing it.
+
+Do NOT propose code edits in the triage. Triage is decision support; edits come after the user picks which findings to act on.
+
+## Notes
+
+- The Agent tool and Bash tool can both run in a single assistant message — that's how you get parallelism for `both` mode. Critic runs are minutes-long; don't serialize them.
+- Subagents return only their final message; their intermediate tool calls and reasoning stay in their own context, not yours.
+- If the user runs `/critique` with no arguments and you can't resolve a TARGET from conversation history or disk-scan fallback, explain the ambiguity and ask rather than picking blindly.

@@ -1,0 +1,6 @@
+# Per-invocation critique archives — local state, not for the repo.
+runs/
+
+# Local rollback backup of the prior fork-context SKILL.md, written automatically
+# during the 2026-05-14 redesign. Not part of the shipped skill.
+SKILL.md.fork-version
